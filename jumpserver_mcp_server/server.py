@@ -8,6 +8,8 @@ It includes:
 
 import typing
 from logging import getLogger
+import re
+from urllib.parse import urlparse, urlunparse
 from typing import Any, Optional
 from uuid import UUID
 
@@ -43,6 +45,9 @@ class JumpServerOpenapiMCP(FastApiMCP):
         api_token = kwargs.pop("api_token")
         self.api_token = api_token
         self.swagger_json = kwargs.pop("swagger_json")
+        # Preserve original behavior: keep a local copy and do not pass to parent
+        # (FastApiMCP 0.3.x builds URLs from the OpenAPI spec; we avoid
+        # surprising its __init__ with unknown kwargs).
         self.base_url = kwargs.pop("base_url", None)
         self.sse_transport = None
         super().__init__(app, **kwargs)
@@ -79,8 +84,38 @@ class JumpServerOpenapiMCP(FastApiMCP):
         self.tools = self._filter_tools(all_tools, openapi_schema)
         logger.info("Filtered to %d tools after applying filters.", len(self.tools))
 
-        # Normalize base URL
-        self._base_url = self._base_url.removesuffix("/")
+        # Normalize/override base URL with defensive checks to avoid double prefixes
+        preferred_base = getattr(self, "base_url", None) or getattr(self, "_base_url", None)
+        if preferred_base:
+            candidate = preferred_base.rstrip("/")
+
+            # Heuristic: derive path prefix from spec to detect duplicates like /api/v1
+            spec_prefix = _extract_spec_base_path(openapi_schema)
+            if spec_prefix:
+                spec_prefix = spec_prefix.rstrip("/")
+            try:
+                parsed = urlparse(candidate)
+                # Only adjust when a scheme is provided; otherwise leave as-is
+                if parsed.scheme in {"http", "https"} and spec_prefix:
+                    path = (parsed.path or "").rstrip("/")
+                    if path.endswith(spec_prefix):
+                        # Remove trailing spec prefix to avoid duplicating it in requests
+                        new_path = path[: -len(spec_prefix)]
+                        # Keep a single '/'
+                        new_path = new_path if new_path else "/"
+                        parsed = parsed._replace(path=new_path)
+                        adjusted = urlunparse(parsed)
+                        logger.warning(
+                            "Adjusted base_url to avoid duplicate prefix '%s': %s -> %s",
+                            spec_prefix,
+                            candidate,
+                            adjusted,
+                        )
+                        candidate = adjusted.rstrip("/")
+            except Exception:  # best-effort; don't fail startup on parsing issues
+                pass
+
+            self._base_url = candidate
 
         # Create the MCP lowlevel server
         mcp_server: Server = Server(self.name, self.description)
@@ -104,12 +139,17 @@ class JumpServerOpenapiMCP(FastApiMCP):
             except Exception as e:
                 logger.error("Error getting session token: %s", e)
                 authorization = ""
-            http_client = httpx.AsyncClient(
-                verify=False, headers={"Authorization": authorization}, timeout=60
-            )
+            # Ensure relative OpenAPI paths resolve correctly by setting base_url
+            client_kwargs = {
+                "verify": False,
+                "headers": {"Authorization": authorization},
+                "timeout": 60,
+            }
+            if getattr(self, "_base_url", None):
+                client_kwargs["base_url"] = self._base_url
+            http_client = httpx.AsyncClient(**client_kwargs)
             return await self._execute_api_tool(
                 client=http_client,
-                base_url=self._base_url or "",
                 tool_name=name,
                 arguments=arguments,
                 operation_map=self.operation_map,
@@ -220,6 +260,60 @@ class OpenAPISchemaFetchError(Exception):
     pass
 
 
+def _extract_spec_base_path(spec: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the base path used by OpenAPI paths.
+
+    Priority:
+    1) Heuristic from `paths` keys (prefer prefixes like /api/vN)
+    2) Swagger 2.0: `basePath`
+    3) OpenAPI 3.x: first `servers[0].url` path
+    """
+    # 1) Derive from paths keys
+    try:
+        paths: dict[str, Any] = spec.get("paths", {}) or {}
+        if paths:
+            sample_keys = list(paths.keys())[:50]
+            # Prefer /api/vN
+            for k in sample_keys:
+                m = re.match(r"^(/api/v\d+)\b", k)
+                if m:
+                    return m.group(1)
+            # Fallback: common first segment
+            seg_counts = {}
+            for k in sample_keys:
+                if k.startswith("/"):
+                    first = k.split("/", 2)[1:2]
+                    if first:
+                        seg_counts[first[0]] = seg_counts.get(first[0], 0) + 1
+            if seg_counts:
+                # If most paths share the same first segment, return it
+                seg, cnt = max(seg_counts.items(), key=lambda x: x[1])
+                if cnt >= max(3, len(sample_keys) // 2):
+                    return f"/{seg}"
+    except Exception:
+        pass
+
+    # 2) Swagger 2.0 basePath
+    base_path = spec.get("basePath")
+    if isinstance(base_path, str) and base_path.startswith("/"):
+        return base_path
+
+    # 3) OpenAPI 3.x servers
+    try:
+        servers = spec.get("servers") or []
+        if servers:
+            url = servers[0].get("url", "")
+            if isinstance(url, str):
+                parsed = urlparse(url)
+                if parsed.path:
+                    return parsed.path
+                # Relative server URL (e.g., "/api/v1")
+                if url.startswith("/"):
+                    return url
+    except Exception:
+        pass
+    return None
+
 def get_swagger_json(url: str = settings.swagger_url) -> dict[str, Any]:
     """Fetch the OpenAPI schema from the given URL.
 
@@ -249,8 +343,9 @@ app = FastAPI()
 jumpserver_url = settings.jumpserver_url
 base_url = settings.api_base_url
 if not base_url and jumpserver_url:
-    base_url = f"{jumpserver_url}/api/v1"
-    logger.info("Base API URL set to: %s", base_url)
+    # Use host root as base; OpenAPI paths typically include /api/v1
+    base_url = jumpserver_url
+    logger.info("Base API URL set to host root: %s", base_url)
 swagger_url = settings.swagger_url
 if not swagger_url and jumpserver_url:
     # swagger_url = f"{jumpserver_url}/api/docs/?format=openapi"

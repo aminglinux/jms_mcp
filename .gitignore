@@ -12,3 +12,5 @@ wheels/
 venv/
 mcp.json
 beartoken_api.sh
+# Local-only docs
+AGENTS.md

@@ -70,8 +70,8 @@ class JumpServerOpenapiMCP(FastApiMCP):
 
         Filter tools and register handlers for tool listing and tool calls.
         """
-        # Get OpenAPI schema from FastAPI app
-        openapi_schema = self.swagger_json
+        # Get OpenAPI schema from FastAPI app and sanitize nullable string fields
+        openapi_schema = _sanitize_openapi_strings(self.swagger_json)
 
         # Convert OpenAPI schema to MCP tools
         all_tools, self.operation_map = convert_openapi_to_mcp_tools(
@@ -324,6 +324,40 @@ def _extract_spec_base_path(spec: dict[str, Any]) -> str | None:
         pass
     return None
 
+
+_STRING_LIKE_KEYS = {
+    "summary",
+    "description",
+    "title",
+    "name",
+    "displayName",
+    "label",
+}
+
+
+def _sanitize_openapi_strings(spec: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of the OpenAPI dict with null string fields replaced by ''.
+
+    Some tool consumers (e.g., MCP clients) treat textual fields as strict strings
+    and error when encountering JSON null. This pass is conservative and only
+    normalizes common text fields used for UI/i18n.
+    """
+
+    def _sanitize(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            out: dict[str, Any] = {}
+            for k, v in obj.items():
+                if k in _STRING_LIKE_KEYS and v is None:
+                    out[k] = ""
+                else:
+                    out[k] = _sanitize(v)
+            return out
+        if isinstance(obj, list):
+            return [_sanitize(x) for x in obj]
+        return obj
+
+    return _sanitize(spec)
+
 def get_swagger_json(url: str = settings.swagger_url) -> dict[str, Any]:
     """Fetch the OpenAPI schema from the given URL.
 
@@ -368,6 +402,7 @@ http_client = httpx.AsyncClient(auth=auth, verify=False)
 mcp = JumpServerOpenapiMCP(
     app,
     name="JumpServer API MCP",
+    description="Expose JumpServer OpenAPI operations as MCP tools.",
     base_url=base_url,
     describe_all_responses=True,  # Include all possible response schemas in tool descriptions
     describe_full_response_schema=True,  # Include full JSON schema in tool descriptions

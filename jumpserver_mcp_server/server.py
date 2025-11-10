@@ -18,6 +18,7 @@ from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi_mcp import FastApiMCP
 from fastapi_mcp.openapi.convert import convert_openapi_to_mcp_tools
 from fastapi_mcp.transport.sse import FastApiSseTransport
+from starlette.requests import ClientDisconnect
 import mcp.types as types
 from mcp.server.lowlevel.server import Server
 
@@ -214,7 +215,16 @@ class JumpServerOpenapiMCP(FastApiMCP):
             f"{mount_path}/messages/", include_in_schema=False, operation_id="mcp_messages"
         )
         async def handle_post_message(request: Request):
-            return await sse_transport.handle_fastapi_post_message(request)
+            """Handle POSTed MCP messages.
+
+            If the client disconnects while sending the request body, treat it as a benign
+            cancellation and return 204 to avoid noisy stack traces.
+            """
+            try:
+                return await sse_transport.handle_fastapi_post_message(request)
+            except ClientDisconnect:
+                logger.info("Client disconnected during POST /messages body read; ignoring.")
+                return Response(status_code=204)
 
         # HACK: If we got a router and not a FastAPI instance, we need to re-include the router so that
         # FastAPI will pick up the new routes we added. The problem with this approach is that we assume

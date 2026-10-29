@@ -135,7 +135,8 @@ class JumpServerOpenapiMCP(FastApiMCP):
                 ctx = mcp_server.request_context
                 session = ctx.session
                 experimental = session._init_options.capabilities.experimental
-                authorization = experimental.get("session_token", {}).get("authorization")
+                #authorization = experimental.get("session_token", {}).get("authorization")
+                authorization = settings.api_token
                 logger.debug("Session token authorization: %s", authorization)
             except Exception as e:
                 logger.error("Error getting session token: %s", e)
@@ -258,7 +259,9 @@ class BearerAuth(httpx.Auth):
         yield request
 
     def _build_auth_header(self, token: str | bytes) -> str:
-        return f"Bearer {token}"
+        t = token.decode() if isinstance(token, bytes) else token
+        t = t.strip()
+        return t if " " in t else f"Bearer {t}"
 
 
 HTTP_OK = 200
@@ -442,3 +445,4 @@ async def check_api_key(request: Request, call_next) -> Response:
             logger.error("Unauthorized access attempt detected: Authorization %s", api_key)
             return Response(status_code=401, content="Unauthorized: Invalid API token")
     return await call_next(request)
+
